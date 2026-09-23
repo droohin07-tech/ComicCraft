@@ -1,76 +1,171 @@
-from datetime import datetime
+from __future__ import annotations
+
+import re
+import uuid
+from pathlib import Path
 
 from huggingface_hub import InferenceClient
 
-from app.config import get_settings
+from app.config import settings
 
 
-class ImageService:
+# ============================================================
+# DIRECTORIES
+# ============================================================
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+BASE_DIR = Path(__file__).resolve().parents[2]
 
-        if not self.settings.hf_token:
+STATIC_DIR = BASE_DIR / "static"
+PANELS_DIR = STATIC_DIR / "panels"
+
+PANELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# HUGGING FACE CLIENT
+# ============================================================
+
+_client = None
+
+
+def get_client() -> InferenceClient:
+    """
+    Create the Hugging Face client only when it is needed.
+    """
+
+    global _client
+
+    if _client is None:
+
+        if not settings.hf_token:
             raise RuntimeError(
-                "HF_TOKEN is not configured. "
-                "Add it to your .env file."
+                "HF_TOKEN is missing from your .env file."
             )
 
-        self.client = InferenceClient(
-            provider=self.settings.hf_provider,
-            api_key=self.settings.hf_token,
+        _client = InferenceClient(
+            provider=settings.hf_provider,
+            api_key=settings.hf_token,
         )
 
-    def generate_image(
-        self,
-        prompt: str,
-        panel_number: int
-    ) -> str:
+    return _client
 
-        enhanced_prompt = f"""
+
+# ============================================================
+# FILENAME HELPER
+# ============================================================
+
+def _safe_filename(text: str) -> str:
+    """
+    Convert an arbitrary prompt into a safe filename.
+    """
+
+    text = str(text)
+
+    text = re.sub(
+        r"[^a-zA-Z0-9_-]+",
+        "_",
+        text,
+    )
+
+    text = text.strip("_")
+
+    if not text:
+        text = "panel"
+
+    return text[:60]
+
+
+# ============================================================
+# IMAGE GENERATION
+# ============================================================
+
+def generate_image(prompt: str) -> str:
+    """
+    Generate one comic panel image using Hugging Face.
+
+    Returns:
+        /static/panels/<filename>.png
+    """
+
+    if not prompt or not prompt.strip():
+        raise ValueError(
+            "Image generation prompt cannot be empty."
+        )
+
+    client = get_client()
+
+    # Strengthen the prompt so the generated image
+    # is appropriate for the ComicCraft workflow.
+    final_prompt = f"""
+Create a high-quality comic book illustration.
+
 {prompt}
 
-Professional sequential comic illustration.
-Strong readable composition.
-Consistent character design.
-Clean linework.
-Cinematic lighting.
-Detailed environment.
-Dynamic composition.
+Visual requirements:
+- clear subject
+- strong composition
+- expressive characters
+- detailed environment
+- cinematic lighting
+- coherent perspective
+- clean artwork
+- no text
+- no speech bubbles
+- no captions
+- no watermark
+- maintain a consistent comic illustration style
+""".strip()
 
-Do NOT include:
-- words
-- letters
-- captions
-- speech bubbles
-- logos
-- watermarks
-"""
+    print()
+    print("=" * 70)
+    print("GENERATING COMIC PANEL IMAGE")
+    print("=" * 70)
+    print(final_prompt)
+    print("=" * 70)
 
-        image = self.client.text_to_image(
-            prompt=enhanced_prompt,
-            model=self.settings.hf_image_model,
-            width=self.settings.image_width,
-            height=self.settings.image_height,
+    try:
+
+        image = client.text_to_image(
+            prompt=final_prompt,
+            model=settings.hf_image_model,
+            width=settings.image_width,
+            height=settings.image_height,
         )
 
-        filename = (
-            f"panel_{panel_number}_"
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            f".png"
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Hugging Face image generation failed: {exc}"
+        ) from exc
+
+    if image is None:
+        raise RuntimeError(
+            "Hugging Face returned no image."
         )
 
-        path = self.settings.panels_dir / filename
+    # ========================================================
+    # SAVE IMAGE
+    # ========================================================
 
-        image.save(path)
-
-        return f"/static/panels/{filename}"
-
-
-def generate_test_image(prompt: str) -> str:
-    service = ImageService()
-
-    return service.generate_image(
-        prompt,
-        0
+    filename = (
+        f"{_safe_filename(prompt)}_"
+        f"{uuid.uuid4().hex[:8]}.png"
     )
+
+    output_path = PANELS_DIR / filename
+
+    try:
+
+        image.save(output_path)
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Could not save generated image: {exc}"
+        ) from exc
+
+    print(f"Image saved: {output_path}")
+    print()
+
+    # Browser-accessible URL
+    return f"/static/panels/{filename}"

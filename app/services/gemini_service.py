@@ -1,141 +1,377 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
 from google import genai
 from google.genai import types
 
-from app.config import get_settings
+from app.config import settings
 from app.schemas import (
+    PromptRequest,
     ComicOutline,
     ComicStory,
-    PromptRequest,
 )
 
 
-class GeminiService:
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+_client = None
 
-        if not self.settings.gemini_api_key:
+
+def get_client():
+    global _client
+
+    if _client is None:
+        if not settings.gemini_api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is not configured. "
-                "Add it to your .env file."
+                "GEMINI_API_KEY is missing from your .env file."
             )
 
-        self.client = genai.Client(
-            api_key=self.settings.gemini_api_key
+        _client = genai.Client(
+            api_key=settings.gemini_api_key
         )
 
-    def _generate_json(
-        self,
-        prompt: str,
-        schema: type
-    ):
-        response = self.client.models.generate_content(
-            model=self.settings.gemini_text_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-                temperature=0.9,
-            ),
+    return _client
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _model_dump(value: Any) -> Any:
+    """
+    Convert Pydantic objects into normal Python dictionaries.
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+
+    if isinstance(value, dict):
+        return value
+
+    return value
+
+
+def _extract_json(response) -> Any:
+    """
+    Extract JSON from a Gemini response.
+
+    Gemini can return:
+        - a Python dictionary
+        - a JSON string
+        - fenced JSON
+        - response.parsed
+        - response.text
+    """
+
+    # --------------------------------------------------------
+    # 1. Structured parsed response
+    # --------------------------------------------------------
+
+    parsed = getattr(response, "parsed", None)
+
+    if parsed is not None:
+        return _model_dump(parsed)
+
+    # --------------------------------------------------------
+    # 2. Raw response text
+    # --------------------------------------------------------
+
+    text = getattr(response, "text", None)
+
+    if not text:
+        raise RuntimeError(
+            "Gemini returned an empty response."
         )
 
-        if not response.text:
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
+    text = text.strip()
 
-        return schema.model_validate_json(
-            response.text
-        )
+    # Remove markdown JSON fences if Gemini adds them
+    if text.startswith("```"):
+        lines = text.splitlines()
 
-    def generate_outline(
-        self,
-        request: PromptRequest
-    ) -> ComicOutline:
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
 
-        prompt = f"""
-Create a coherent five-panel comic outline.
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
 
-User story idea:
-{request.story_prompt}
+        text = "\n".join(lines).strip()
 
-Main character:
-{request.character_name}
+    try:
+        return json.loads(text)
 
-Setting:
-{request.setting}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Gemini returned invalid JSON.\n\n"
+            f"Raw response:\n{text}"
+        ) from exc
 
-Tone:
-{request.tone}
 
-Art style:
-{request.art_style}
+def _extract_panels(data: Any) -> list:
+    """
+    Normalize all likely Gemini response structures into:
+
+        [
+            {...},
+            {...},
+            ...
+        ]
+
+    Accepted formats:
+
+        {"panels": [...]}
+
+        {"outline": {"panels": [...]}}
+
+        {"story": {"panels": [...]}}
+
+        [{"panel_number": 1, ...}, ...]
+    """
+
+    data = _model_dump(data)
+
+    # --------------------------------------------------------
+    # Direct list
+    # --------------------------------------------------------
+
+    if isinstance(data, list):
+        return data
+
+    # --------------------------------------------------------
+    # Dictionary
+    # --------------------------------------------------------
+
+    if isinstance(data, dict):
+
+        # Normal expected format
+        panels = data.get("panels")
+
+        if isinstance(panels, list):
+            return panels
+
+        # Sometimes nested under "outline"
+        outline = data.get("outline")
+
+        if isinstance(outline, dict):
+            panels = outline.get("panels")
+
+            if isinstance(panels, list):
+                return panels
+
+        # Sometimes nested under "story"
+        story = data.get("story")
+
+        if isinstance(story, dict):
+            panels = story.get("panels")
+
+            if isinstance(panels, list):
+                return panels
+
+        # Sometimes Gemini wraps the actual result
+        result = data.get("result")
+
+        if isinstance(result, dict):
+            panels = result.get("panels")
+
+            if isinstance(panels, list):
+                return panels
+
+    raise RuntimeError(
+        "Gemini outline did not contain a panel list.\n\n"
+        f"Received:\n{json.dumps(data, indent=2, ensure_ascii=False)}"
+    )
+
+
+# ============================================================
+# GENERIC GEMINI JSON GENERATOR
+# ============================================================
+
+def _generate_json(
+    prompt: str,
+    schema,
+):
+    client = get_client()
+
+    response = client.models.generate_content(
+        model=settings.gemini_text_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+
+    return _extract_json(response)
+
+
+# ============================================================
+# GENERATE 5-PANEL OUTLINE
+# ============================================================
+
+def generate_outline(
+    prompt_data: PromptRequest,
+) -> ComicOutline:
+
+    prompt = f"""
+You are a professional comic book story planner.
+
+Create a complete comic story outline consisting of EXACTLY 5 panels.
+
+USER STORY:
+{prompt_data.story_prompt}
+
+MAIN CHARACTER:
+{prompt_data.character_name}
+
+SETTING:
+{prompt_data.setting}
+
+TONE:
+{prompt_data.tone}
+
+ART STYLE:
+{prompt_data.art_style}
 
 Requirements:
 
-- Exactly 5 panels.
-- Preserve the user's character.
-- Preserve the requested setting.
-- Preserve the requested tone.
-- The story must progress logically from panel 1 to panel 5.
-- Every panel needs a clear visual scene.
-- Every panel needs an image-generation prompt.
-- Keep the protagonist visually consistent.
-- Describe clothing, appearance, environment and action
-  whenever useful.
-- Do not place dialogue or text inside the generated images.
-- Do not add logos or watermarks.
-"""
+1. Create EXACTLY 5 panels.
+2. Each panel must advance the story.
+3. Keep the main character consistent.
+4. Make the visual descriptions detailed enough for an image-generation model.
+5. Every image prompt must describe the actual scene to draw.
+6. Do not put dialogue inside image prompts.
+7. Do not include speech bubbles.
+8. Do not include captions inside generated images.
+9. Do not include watermarks.
+10. Make the five panels form one coherent beginning, middle, and ending.
 
-        return self._generate_json(
-            prompt,
-            ComicOutline
+Return JSON matching the requested schema.
+""".strip()
+
+    raw_data = _generate_json(
+        prompt,
+        ComicOutline,
+    )
+
+    # --------------------------------------------------------
+    # Normalize Gemini's response
+    # --------------------------------------------------------
+
+    panels = _extract_panels(raw_data)
+
+    if len(panels) != 5:
+        raise RuntimeError(
+            f"Gemini returned {len(panels)} panels. "
+            "Exactly 5 panels are required."
         )
 
-    def generate_story(
-        self,
-        request: PromptRequest,
-        outline: ComicOutline
-    ) -> ComicStory:
+    # Make sure panel numbers exist
+    normalized_panels = []
 
-        outline_text = outline.model_dump_json(
-            indent=2
-        )
+    for index, panel in enumerate(panels, start=1):
 
-        prompt = f"""
-Write the final five-panel comic script
-from the following outline.
+        if not isinstance(panel, dict):
+            raise RuntimeError(
+                f"Panel {index} is not a JSON object."
+            )
 
-Character:
-{request.character_name}
+        panel = dict(panel)
 
-Setting:
-{request.setting}
+        panel["panel_number"] = index
 
-Tone:
-{request.tone}
+        normalized_panels.append(panel)
 
-Original story:
-{request.story_prompt}
+    return ComicOutline(
+        panels=normalized_panels
+    )
 
-Outline:
-{outline_text}
+
+# ============================================================
+# GENERATE STORY / DIALOGUE
+# ============================================================
+
+def generate_story(
+    prompt_data: PromptRequest,
+    outline: ComicOutline,
+) -> ComicStory:
+
+    outline_data = _model_dump(outline)
+
+    prompt = f"""
+You are a professional comic book script writer.
+
+Create narration, captions, and dialogue for the following
+5-panel comic.
+
+ORIGINAL STORY:
+{prompt_data.story_prompt}
+
+MAIN CHARACTER:
+{prompt_data.character_name}
+
+SETTING:
+{prompt_data.setting}
+
+TONE:
+{prompt_data.tone}
+
+ART STYLE:
+{prompt_data.art_style}
+
+COMIC OUTLINE:
+{json.dumps(
+    outline_data,
+    indent=2,
+    ensure_ascii=False
+)}
 
 Requirements:
 
-- Exactly 5 story objects.
-- Panel numbers must match the outline.
-- Each panel gets a short caption.
-- Each panel gets narration.
-- Each panel may have dialogue.
-- Dialogue must feel natural.
-- Maintain continuity.
-- Do not change the protagonist.
-- Do not change the setting without narrative reason.
-- Keep each panel concise enough for a comic.
-"""
+1. Create EXACTLY 5 panels.
+2. Keep panel numbers 1 through 5.
+3. Match the provided outline exactly.
+4. Write concise comic captions.
+5. Write concise narration.
+6. Write natural dialogue.
+7. Do not put dialogue into image prompts.
+8. Do not create additional panels.
+9. Keep character names and story events consistent.
+10. The ending should provide a satisfying conclusion.
 
-        return self._generate_json(
-            prompt,
-            ComicStory
+Return JSON matching the requested schema.
+""".strip()
+
+    raw_data = _generate_json(
+        prompt,
+        ComicStory,
+    )
+
+    panels = _extract_panels(raw_data)
+
+    if len(panels) != 5:
+        raise RuntimeError(
+            f"Gemini returned {len(panels)} story panels. "
+            "Exactly 5 panels are required."
         )
+
+    normalized_panels = []
+
+    for index, panel in enumerate(panels, start=1):
+
+        if not isinstance(panel, dict):
+            raise RuntimeError(
+                f"Story panel {index} is not a JSON object."
+            )
+
+        panel = dict(panel)
+
+        panel["panel_number"] = index
+
+        normalized_panels.append(panel)
+
+    return ComicStory(
+        panels=normalized_panels
+    )
